@@ -186,7 +186,9 @@ class ExtraSGD(ExtragradientOptimizer):
         super().__init__(params, defaults)
 
     def __setstate__(self, state: dict) -> None:
-        super(torch.optim.SGD, self).__setstate__(state)
+        # ExtraSGD does not subclass torch.optim.SGD, so `super(torch.optim.SGD, self)`
+        # raised a TypeError (e.g. in `load_state_dict`).
+        super().__setstate__(state)
         for group in self.param_groups:
             group.setdefault("nesterov", False)
 
@@ -318,3 +320,128 @@ class ExtraAdam(ExtragradientOptimizer):
         step_size = group["lr"] * math.sqrt(bias_correction2) / bias_correction1
 
         return -step_size * exp_avg / denom
+
+
+class ExtraNuPI(ExtragradientOptimizer):
+    r"""The :py:class:`~cooper.optim.nuPI` controller with an extrapolation step.
+
+    This makes nuPI compatible with
+    :py:class:`~cooper.optim.ExtrapolationConstrainedOptimizer`, so that the
+    Lagrange multipliers can be updated by a PI controller while the whole
+    primal-dual game is solved with extragradient.
+
+    The update is the (SGD-initialized) nuPI update. With error
+    :math:`e_t = \nabla_{\vlambda} \Lag` (the constraint violation, for a dual
+    optimizer with ``maximize=True``):
+
+    .. math::
+        \Delta_t = K_I e_t + K_P (1 - \nu) (e_t - \xi_{t-1}), \qquad
+        \xi_t = \nu \xi_{t-1} + (1 - \nu) e_t, \qquad \xi_0 = e_0,
+
+    and the proportional term is omitted at the very first update, so that the
+    first step matches SGD with learning rate :math:`\eta K_I`.
+
+    Extragradient calls :py:meth:`update` twice per iteration: once at the
+    current point (extrapolation) and once at the extrapolated point (the
+    actual step, applied from the current point). ``xi_update`` decides when
+    the error memory :math:`\xi` is updated:
+
+    * ``"step"`` (default): only during the actual step. :math:`\xi` then
+      tracks the errors measured at the extrapolated points, i.e. the errors
+      that drive the actual updates, and the extrapolation uses :math:`\xi`
+      without modifying it. The actual steps form a nuPI controller acting on
+      the sequence of look-ahead errors.
+    * ``"both"``: during both calls, mirroring how
+      :py:class:`ExtraSGD` / :py:class:`ExtraAdam` update their momentum
+      buffers / moment estimates. The proportional term of the actual step
+      then compares the look-ahead error with the error at the current point.
+
+    With ``Kp=0`` and ``ema_nu=0`` both variants reduce exactly to
+    :py:class:`ExtraSGD` (no momentum) with learning rate ``lr * Ki``.
+
+    .. note::
+        nuPI with :math:`K_P = 1` (and :math:`\nu = 0`) corresponds to optimistic
+        gradient ascent, itself an approximation of extragradient
+        ("extrapolation from the past"). Combining extragradient with a large
+        :math:`K_P` may therefore apply this damping twice.
+
+    Args:
+        params: Iterable of parameters to optimize or dicts defining parameter groups.
+        lr: Learning rate.
+        weight_decay: Weight decay (applied after the error terms, as in nuPI).
+        Kp: Proportional gain (a float).
+        Ki: Integral gain (a float).
+        ema_nu: EMA coefficient :math:`\nu \in [0, 1)` of the error memory.
+        xi_update: ``"step"`` or ``"both"``, see above.
+        maximize: Maximize the objective (use ``True`` for dual optimizers).
+    """
+
+    def __init__(
+        self,
+        params: Iterable,
+        lr: float,
+        weight_decay: float = 0.0,
+        Kp: float = 0.0,
+        Ki: float = 1.0,
+        ema_nu: float = 0.0,
+        xi_update: str = "step",
+        maximize: bool = False,
+    ) -> None:
+        if lr < 0.0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if weight_decay < 0.0:
+            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+        if Kp < 0.0 or Ki < 0.0:
+            raise ValueError(f"Kp and Ki must be non-negative, got Kp={Kp}, Ki={Ki}")
+        if Kp == 0.0 and Ki == 0.0:
+            raise ValueError("Kp and Ki cannot both be zero.")
+        if not 0.0 <= ema_nu < 1.0:
+            raise ValueError(f"Invalid ema_nu value: {ema_nu}")
+        if xi_update not in {"step", "both"}:
+            raise ValueError(f"xi_update must be 'step' or 'both', got {xi_update!r}")
+
+        defaults = {
+            "lr": lr,
+            "weight_decay": weight_decay,
+            "Kp": Kp,
+            "Ki": Ki,
+            "ema_nu": ema_nu,
+            "xi_update": xi_update,
+            "maximize": maximize,
+        }
+        super().__init__(params, defaults)
+        self._is_extrapolating = False
+
+    def extrapolation(self) -> None:
+        self._is_extrapolating = True
+        try:
+            super().extrapolation()
+        finally:
+            self._is_extrapolating = False
+
+    def update(self, p: torch.Tensor, group: dict) -> Optional[torch.Tensor]:
+        if p.grad is None:
+            return None
+        if p.grad.is_sparse:
+            raise NotImplementedError("ExtraNuPI does not support sparse gradients.")
+
+        error = p.grad.detach()
+        Kp, Ki, ema_nu = group["Kp"], group["Ki"], group["ema_nu"]
+        state = self.state[p]
+        uses_kp_term = Kp * (1 - ema_nu) != 0
+
+        nupi_update = error.mul(Ki)
+        if uses_kp_term and "xi" in state:
+            nupi_update.add_((error - state["xi"]).mul(Kp * (1 - ema_nu)))
+        if group["weight_decay"] != 0:
+            nupi_update.add_(p.data, alpha=-group["weight_decay"] if group["maximize"] else group["weight_decay"])
+
+        commit = (not self._is_extrapolating) or group["xi_update"] == "both"
+        if uses_kp_term and commit:
+            if "xi" not in state:
+                state["xi"] = error.clone()  # xi_0 = e_0 (SGD initialization)
+            else:
+                state["xi"].mul_(ema_nu).add_(error, alpha=1 - ema_nu)
+
+        alpha = group["lr"] if group["maximize"] else -group["lr"]
+        return nupi_update.mul_(alpha)
