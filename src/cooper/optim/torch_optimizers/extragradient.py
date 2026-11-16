@@ -186,7 +186,9 @@ class ExtraSGD(ExtragradientOptimizer):
         super().__init__(params, defaults)
 
     def __setstate__(self, state: dict) -> None:
-        super(torch.optim.SGD, self).__setstate__(state)
+        # ExtraSGD does not subclass torch.optim.SGD, so `super(torch.optim.SGD, self)`
+        # raised a TypeError (e.g. in `load_state_dict`).
+        super().__setstate__(state)
         for group in self.param_groups:
             group.setdefault("nesterov", False)
 
