@@ -9,7 +9,7 @@ from .constrained_optimizers import (
     SimultaneousOptimizer,
 )
 from .optimizer import CooperOptimizer, CooperOptimizerState, RollOut
-from .torch_optimizers import ExtraAdam, ExtragradientOptimizer, ExtraSGD, nuPI, nuPIInitType
+from .torch_optimizers import ExtraAdam, ExtragradientOptimizer, ExtraNuPI, ExtraSGD, nuPI, nuPIInitType
 from .unconstrained_optimizer import UnconstrainedOptimizer
 
 __all__ = [
@@ -19,6 +19,7 @@ __all__ = [
     "CooperOptimizer",
     "CooperOptimizerState",
     "ExtraAdam",
+    "ExtraNuPI",
     "ExtraSGD",
     "ExtragradientOptimizer",
     "ExtrapolationConstrainedOptimizer",
